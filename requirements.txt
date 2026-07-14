@@ -1,0 +1,10 @@
+# Core text extraction + analysis
+pymupdf>=1.24.0        # PDF text extraction (imported as "fitz")
+anthropic>=0.40.0      # Claude API client
+langdetect>=1.0.9      # Language detection
+
+# OCR fallback for scanned / image-only PDFs (e.g. some Hindi orders).
+# These also need the system tools Tesseract and Poppler installed --
+# see README.md. If you don't need OCR, you can skip these two.
+pytesseract>=0.3.10
+pdf2image>=1.17.0
