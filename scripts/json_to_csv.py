@@ -26,6 +26,7 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -92,23 +93,47 @@ def split_case(record):
     return row, children
 
 
-def ordered_columns(rows, first):
-    seen = {key for row in rows for key in row}
-    columns = [c for c in first if c in seen]
-    for row in rows:
-        for key in row:
-            if key not in columns:
-                columns.append(key)
-    return columns
+def iter_json_files(folder):
+    """Yield .json files under folder one at a time (no big list in memory)."""
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                yield from iter_json_files(entry.path)
+            elif entry.name.lower().endswith(".json"):
+                yield Path(entry.path)
 
 
-def write_csv(path, rows, first):
-    columns = ordered_columns(rows, first)
+def iter_cases(input_dir, errors=None):
+    """Yield (path, case_row, children) for every case, reading files lazily."""
+    for path in iter_json_files(input_dir):
+        try:
+            data = load_json(path)
+        except (ValueError, OSError) as e:
+            if errors is not None:
+                errors.append((path, e))
+            continue
+        records = data if isinstance(data, list) else [data]
+        for record in records:
+            if not isinstance(record, dict):
+                if errors is not None:
+                    errors.append((path, "not a JSON object"))
+                continue
+            row, children = split_case(record)
+            row["SourceFolder"] = path.parent.name
+            row["SourceFile"] = str(path.relative_to(input_dir))
+            yield path, row, children
+
+
+def ordered(keys, first):
+    return [c for c in first if c in keys] + [k for k in keys if k not in first]
+
+
+def open_csv(path, columns):
     # utf-8-sig so Excel shows Hindi and other non-ASCII text correctly
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(rows)
+    f = open(path, "w", newline="", encoding="utf-8-sig")
+    writer = csv.DictWriter(f, fieldnames=columns)
+    writer.writeheader()
+    return f, writer
 
 
 def main():
@@ -118,45 +143,62 @@ def main():
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("."))
     args = parser.parse_args()
 
-    json_files = sorted(args.input_dir.rglob("*.json"))
-    if not json_files:
-        sys.exit(f"No .json files found under {args.input_dir}")
+    # Pass 1: find every column name, so each CSV gets a complete header.
+    # Only the column names are kept in memory, not the data.
+    print("Pass 1/2: scanning columns ...")
+    case_keys, child_keys = {}, defaultdict(dict)
+    errors, n_cases = [], 0
+    for _, row, children in iter_cases(args.input_dir, errors):
+        n_cases += 1
+        case_keys.update(dict.fromkeys(row))
+        for key, rows in children.items():
+            for child in rows:
+                child_keys[key].update(dict.fromkeys(child))
+        if n_cases % 10000 == 0:
+            print(f"  {n_cases} cases scanned")
+    if not n_cases:
+        sys.exit(f"No readable .json files found under {args.input_dir}")
 
-    cases, children, errors = [], defaultdict(list), []
-    for path in json_files:
-        try:
-            data = load_json(path)
-        except (ValueError, OSError) as e:
-            errors.append((path, e))
-            continue
-        records = data if isinstance(data, list) else [data]
-        for record in records:
-            if not isinstance(record, dict):
-                errors.append((path, "not a JSON object"))
-                continue
-            row, case_children = split_case(record)
-            row["SourceFolder"] = path.parent.name
-            row["SourceFile"] = str(path.relative_to(args.input_dir))
-            cases.append(row)
-            for key, rows in case_children.items():
-                children[key].extend(rows)
+    # A list field that holds records in some files but is empty in others
+    # becomes a count column everywhere.
+    for key in child_keys:
+        case_keys.pop(key, None)
+        case_keys[f"{key}_count"] = None
 
-    # A list field that holds records in one file but is empty in another must
-    # not be blank in some rows and a count in others.
-    for key in children:
-        for row in cases:
-            if row.get(key) == "":
-                del row[key]
-                row[f"{key}_count"] = 0
-
+    # Pass 2: read the files again and write each row straight to disk.
+    print("Pass 2/2: writing CSV files ...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(args.output_dir / "cases.csv", cases, CASE_COLUMNS_FIRST)
-    print(f"Read {len(json_files)} JSON files -> {len(cases)} cases")
-    print(f"  cases.csv: {len(cases)} rows")
-    for key, rows in children.items():
+    files = {}
+    case_file, case_writer = open_csv(args.output_dir / "cases.csv",
+                                      ordered(case_keys, CASE_COLUMNS_FIRST))
+    child_writers, child_counts = {}, defaultdict(int)
+    for key, keys in child_keys.items():
         name = CHILD_FILE_NAMES.get(key, f"{key}.csv")
-        write_csv(args.output_dir / name, rows, KEY_COLUMNS)
-        print(f"  {name}: {len(rows)} rows")
+        files[key], child_writers[key] = open_csv(args.output_dir / name,
+                                                  ordered(keys, KEY_COLUMNS))
+    try:
+        written = 0
+        for _, row, children in iter_cases(args.input_dir):
+            for key in child_keys:
+                if row.get(key) == "":
+                    del row[key]
+                    row[f"{key}_count"] = 0
+            case_writer.writerow(row)
+            for key, rows in children.items():
+                child_writers[key].writerows(rows)
+                child_counts[key] += len(rows)
+            written += 1
+            if written % 10000 == 0:
+                print(f"  {written} cases written")
+    finally:
+        case_file.close()
+        for f in files.values():
+            f.close()
+
+    print(f"Done. Output in {args.output_dir}")
+    print(f"  cases.csv: {written} rows")
+    for key in child_keys:
+        print(f"  {CHILD_FILE_NAMES.get(key, key + '.csv')}: {child_counts[key]} rows")
     for path, err in errors:
         print(f"  skipped {path}: {err}", file=sys.stderr)
 
