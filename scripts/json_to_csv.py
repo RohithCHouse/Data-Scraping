@@ -28,6 +28,7 @@ import csv
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -136,6 +137,11 @@ def open_csv(path, columns):
     return f, writer
 
 
+def elapsed(started):
+    minutes, seconds = divmod(int(time.time() - started), 60)
+    return f"{minutes} min {seconds} s"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -143,20 +149,28 @@ def main():
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("."))
     args = parser.parse_args()
 
-    # Pass 1: find every column name, so each CSV gets a complete header.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = args.output_dir / "_json_to_csv_temp.jsonl"
+    started = time.time()
+
+    # Pass 1: read every JSON file once. Save what was read to one temporary
+    # file and note every column name, so each CSV gets a complete header.
     # Only the column names are kept in memory, not the data.
-    print("Pass 1/2: scanning columns ...")
+    print("Pass 1/2: reading JSON files ...")
     case_keys, child_keys = {}, defaultdict(dict)
     errors, n_cases = [], 0
-    for _, row, children in iter_cases(args.input_dir, errors):
-        n_cases += 1
-        case_keys.update(dict.fromkeys(row))
-        for key, rows in children.items():
-            for child in rows:
-                child_keys[key].update(dict.fromkeys(child))
-        if n_cases % 10000 == 0:
-            print(f"  {n_cases} cases scanned")
+    with open(temp_path, "w", encoding="utf-8") as temp:
+        for _, row, children in iter_cases(args.input_dir, errors):
+            n_cases += 1
+            case_keys.update(dict.fromkeys(row))
+            for key, rows in children.items():
+                for child in rows:
+                    child_keys[key].update(dict.fromkeys(child))
+            temp.write(json.dumps([row, children], ensure_ascii=False) + "\n")
+            if n_cases % 10000 == 0:
+                print(f"  {n_cases} cases read ({elapsed(started)})")
     if not n_cases:
+        temp_path.unlink()
         sys.exit(f"No readable .json files found under {args.input_dir}")
 
     # A list field that holds records in some files but is empty in others
@@ -165,9 +179,9 @@ def main():
         case_keys.pop(key, None)
         case_keys[f"{key}_count"] = None
 
-    # Pass 2: read the files again and write each row straight to disk.
-    print("Pass 2/2: writing CSV files ...")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Pass 2: read the temporary file (one file, so this is quick) and write
+    # each row straight to the CSVs.
+    print(f"Pass 2/2: writing CSV files ... ({elapsed(started)})")
     files = {}
     case_file, case_writer = open_csv(args.output_dir / "cases.csv",
                                       ordered(case_keys, CASE_COLUMNS_FIRST))
@@ -178,24 +192,27 @@ def main():
                                                   ordered(keys, KEY_COLUMNS))
     try:
         written = 0
-        for _, row, children in iter_cases(args.input_dir):
-            for key in child_keys:
-                if row.get(key) == "":
-                    del row[key]
-                    row[f"{key}_count"] = 0
-            case_writer.writerow(row)
-            for key, rows in children.items():
-                child_writers[key].writerows(rows)
-                child_counts[key] += len(rows)
-            written += 1
-            if written % 10000 == 0:
-                print(f"  {written} cases written")
+        with open(temp_path, encoding="utf-8") as temp:
+            for line in temp:
+                row, children = json.loads(line)
+                for key in child_keys:
+                    if row.get(key) == "":
+                        del row[key]
+                        row[f"{key}_count"] = 0
+                case_writer.writerow(row)
+                for key, rows in children.items():
+                    child_writers[key].writerows(rows)
+                    child_counts[key] += len(rows)
+                written += 1
+                if written % 50000 == 0:
+                    print(f"  {written} cases written ({elapsed(started)})")
     finally:
         case_file.close()
         for f in files.values():
             f.close()
+    temp_path.unlink()
 
-    print(f"Done. Output in {args.output_dir}")
+    print(f"Done in {elapsed(started)}. Output in {args.output_dir}")
     print(f"  cases.csv: {written} rows")
     for key in child_keys:
         print(f"  {CHILD_FILE_NAMES.get(key, key + '.csv')}: {child_counts[key]} rows")
