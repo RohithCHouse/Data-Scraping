@@ -16,6 +16,11 @@ ignored) and writes into OUTPUT_DIR:
   <Field>.csv   the same for any other list of records that has data in at
                 least one file (InterimOrders, TaggedMatters, Notices, ...).
 
+  fields_report.csv
+                every field found in any JSON file (including fields inside
+                lists), how many cases have it, how many have a non-empty
+                value, and which CSV file and column it was written to.
+
 Every child CSV starts with Cnr and CaseNumber so it can be joined back to
 cases.csv. Columns are the union of keys across all files, so a field missing
 from some files is left blank.
@@ -46,7 +51,7 @@ CASE_COLUMNS_FIRST = [
     "AssessmentYear", "CourtName", "BenchName", "District", "State",
     "CaseStatus", "StageOfCase", "StageOfCaseRaw", "FilingDate",
     "FirstHearingDate", "LastHearingDate", "LastBusinessDate",
-    "NextHearingDate", "FilingToFirstHearingDays", "Petitioners",
+    "NextHearingDate", "DecisionDate", "FilingToFirstHearingDays", "Petitioners",
     "PetitionerAdvocates", "Respondents", "RespondentAdvocates", "Judges",
 ]
 KEY_COLUMNS = ["Cnr", "CaseNumber"]
@@ -122,11 +127,44 @@ def iter_cases(input_dir, errors=None):
             row, children = split_case(record)
             row["SourceFolder"] = path.parent.name
             row["SourceFile"] = str(path.relative_to(input_dir))
-            yield path, row, children
+            yield path, record, row, children
+
+
+SOURCE_COLUMNS = ["SourceFolder", "SourceFile"]
 
 
 def ordered(keys, first):
-    return [c for c in first if c in keys] + [k for k in keys if k not in first]
+    """Known columns first, then every other field A-Z, then counts and source.
+
+    Sorting the rest keeps the order the same on every run and makes a field
+    like DecisionDate easy to find, wherever in the folders it first appears.
+    """
+    rest = [k for k in keys if k not in first and k not in SOURCE_COLUMNS]
+    counts = sorted(k for k in rest if k.endswith("_count"))
+    rest = sorted((k for k in rest if not k.endswith("_count")), key=str.lower)
+    return ([c for c in first if c in keys] + rest + counts
+            + [c for c in SOURCE_COLUMNS if c in keys])
+
+
+def is_empty(value):
+    return value is None or value == "" or value == [] or value == {}
+
+
+def field_locations(record):
+    """Yield (field path, value, csv file, column) for every field in a case."""
+    for key, value in record.items():
+        if isinstance(value, list) and any(isinstance(v, dict) for v in value):
+            yield key, value, "cases.csv", f"{key}_count"
+            name = CHILD_FILE_NAMES.get(key, f"{key}.csv")
+            for item in value:
+                if isinstance(item, dict):
+                    for sub_key, sub_value in item.items():
+                        yield f"{key}[].{sub_key}", sub_value, name, sub_key
+        elif isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                yield f"{key}.{sub_key}", sub_value, "cases.csv", f"{key}.{sub_key}"
+        else:
+            yield key, value, "cases.csv", key
 
 
 def open_csv(path, columns):
@@ -135,6 +173,18 @@ def open_csv(path, columns):
     writer = csv.DictWriter(f, fieldnames=columns)
     writer.writeheader()
     return f, writer
+
+
+def write_fields_report(path, fields, n_cases):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Field", "CasesWithField", "CasesWithValue",
+                         "PercentWithValue", "WrittenToFile", "Column",
+                         "ExampleFileWithValue"])
+        for name in sorted(fields, key=str.lower):
+            has, filled, csv_file, column, example = fields[name]
+            writer.writerow([name, has, filled, f"{100 * filled / n_cases:.1f}%",
+                             csv_file, column, example])
 
 
 def elapsed(started):
@@ -148,6 +198,8 @@ def main():
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("."))
     args = parser.parse_args()
+    if not args.input_dir.is_dir():
+        sys.exit(f"Input folder not found: {args.input_dir}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     temp_path = args.output_dir / "_json_to_csv_temp.jsonl"
@@ -158,10 +210,25 @@ def main():
     # Only the column names are kept in memory, not the data.
     print("Pass 1/2: reading JSON files ...")
     case_keys, child_keys = {}, defaultdict(dict)
+    # field path -> [cases that have it, cases with a value, file, column, example]
+    fields = {}
     errors, n_cases = [], 0
     with open(temp_path, "w", encoding="utf-8") as temp:
-        for _, row, children in iter_cases(args.input_dir, errors):
+        for path, record, row, children in iter_cases(args.input_dir, errors):
             n_cases += 1
+            seen, filled = set(), set()
+            for name, value, csv_file, column in field_locations(record):
+                if name not in fields:
+                    fields[name] = [0, 0, csv_file, column, ""]
+                seen.add(name)
+                if not is_empty(value):
+                    filled.add(name)
+                    if not fields[name][4]:
+                        fields[name][4] = str(path.relative_to(args.input_dir))
+            for name in seen:
+                fields[name][0] += 1
+            for name in filled:
+                fields[name][1] += 1
             case_keys.update(dict.fromkeys(row))
             for key, rows in children.items():
                 for child in rows:
@@ -178,6 +245,10 @@ def main():
     for key in child_keys:
         case_keys.pop(key, None)
         case_keys[f"{key}_count"] = None
+        if key in fields:
+            fields[key][3] = f"{key}_count"
+
+    write_fields_report(args.output_dir / "fields_report.csv", fields, n_cases)
 
     # Pass 2: read the temporary file (one file, so this is quick) and write
     # each row straight to the CSVs.
@@ -196,9 +267,10 @@ def main():
             for line in temp:
                 row, children = json.loads(line)
                 for key in child_keys:
+                    # Empty or missing in this case: a count of 0, not blank
                     if row.get(key) == "":
                         del row[key]
-                        row[f"{key}_count"] = 0
+                    row.setdefault(f"{key}_count", 0)
                 case_writer.writerow(row)
                 for key, rows in children.items():
                     child_writers[key].writerows(rows)
@@ -214,6 +286,7 @@ def main():
 
     print(f"Done in {elapsed(started)}. Output in {args.output_dir}")
     print(f"  cases.csv: {written} rows")
+    print(f"  fields_report.csv: {len(fields)} fields (where each JSON field went)")
     for key in child_keys:
         print(f"  {CHILD_FILE_NAMES.get(key, key + '.csv')}: {child_counts[key]} rows")
     for path, err in errors:
